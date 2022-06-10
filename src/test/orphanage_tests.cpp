@@ -20,18 +20,29 @@ BOOST_FIXTURE_TEST_SUITE(orphanage_tests, TestingSetup)
 class TxOrphanageTest : public TxOrphanage
 {
 public:
-    inline size_t CountOrphans() const EXCLUSIVE_LOCKS_REQUIRED(g_cs_orphans)
+    CTransactionRef RandomOrphan() LOCKS_EXCLUDED(g_cs_orphans)
     {
-        return m_orphans.size();
-    }
-
-    CTransactionRef RandomOrphan() EXCLUSIVE_LOCKS_REQUIRED(g_cs_orphans)
-    {
+        LOCK(g_cs_orphans);
         std::map<uint256, OrphanTx>::iterator it;
         it = m_orphans.lower_bound(InsecureRand256());
         if (it == m_orphans.end())
             it = m_orphans.begin();
         return it->second.tx;
+    }
+
+    bool CheckAddTx(const CTransactionRef& tx, NodeId peer, bool before = false, bool after = true)
+    {
+        LOCK(g_cs_orphans);
+        bool get_tx = GetTx(tx->GetHash()).first != nullptr;
+        bool have_tx = HaveTx(GenTxid::Txid(tx->GetHash())) || HaveTx(GenTxid::Wtxid(tx->GetHash()));
+        BOOST_CHECK(have_tx == before);
+        BOOST_CHECK(get_tx == before);
+        BOOST_CHECK(AddTx(tx, peer) == after);
+        get_tx = GetTx(tx->GetHash()).first != nullptr;
+        have_tx = HaveTx(GenTxid::Txid(tx->GetHash())) || HaveTx(GenTxid::Wtxid(tx->GetHash()));
+        BOOST_CHECK(have_tx == after);
+        BOOST_CHECK(get_tx == after);
+        return after;
     }
 };
 
@@ -59,8 +70,6 @@ BOOST_AUTO_TEST_CASE(DoS_mapOrphans)
     FillableSigningProvider keystore;
     BOOST_CHECK(keystore.AddKey(key));
 
-    LOCK(g_cs_orphans);
-
     // 50 orphan transactions:
     for (int i = 0; i < 50; i++)
     {
@@ -73,7 +82,7 @@ BOOST_AUTO_TEST_CASE(DoS_mapOrphans)
         tx.vout[0].nValue = 1*CENT;
         tx.vout[0].scriptPubKey = GetScriptForDestination(PKHash(key.GetPubKey()));
 
-        orphanage.AddTx(MakeTransactionRef(tx), i);
+        orphanage.CheckAddTx(MakeTransactionRef(tx), i);
     }
 
     // ... and 50 that depend on other orphans:
@@ -90,7 +99,7 @@ BOOST_AUTO_TEST_CASE(DoS_mapOrphans)
         tx.vout[0].scriptPubKey = GetScriptForDestination(PKHash(key.GetPubKey()));
         BOOST_CHECK(SignSignature(keystore, *txPrev, tx, 0, SIGHASH_ALL));
 
-        orphanage.AddTx(MakeTransactionRef(tx), i);
+        WITH_LOCK(g_cs_orphans, orphanage.AddTx(MakeTransactionRef(tx), i));
     }
 
     // This really-big orphan should be ignored:
@@ -114,24 +123,24 @@ BOOST_AUTO_TEST_CASE(DoS_mapOrphans)
         for (unsigned int j = 1; j < tx.vin.size(); j++)
             tx.vin[j].scriptSig = tx.vin[0].scriptSig;
 
-        BOOST_CHECK(!orphanage.AddTx(MakeTransactionRef(tx), i));
+        orphanage.CheckAddTx(MakeTransactionRef(tx), i, false, false);
     }
 
     // Test EraseOrphansFor:
     for (NodeId i = 0; i < 3; i++)
     {
-        size_t sizeBefore = orphanage.CountOrphans();
-        orphanage.EraseForPeer(i);
-        BOOST_CHECK(orphanage.CountOrphans() < sizeBefore);
+        size_t sizeBefore = orphanage.Size();
+        WITH_LOCK(g_cs_orphans, orphanage.EraseForPeer(i));
+        BOOST_CHECK(orphanage.Size() < sizeBefore);
     }
 
     // Test LimitOrphanTxSize() function:
-    orphanage.LimitOrphans(40);
-    BOOST_CHECK(orphanage.CountOrphans() <= 40);
-    orphanage.LimitOrphans(10);
-    BOOST_CHECK(orphanage.CountOrphans() <= 10);
-    orphanage.LimitOrphans(0);
-    BOOST_CHECK(orphanage.CountOrphans() == 0);
+    WITH_LOCK(g_cs_orphans, orphanage.LimitOrphans(40));
+    BOOST_CHECK(orphanage.Size() <= 40);
+    WITH_LOCK(g_cs_orphans, orphanage.LimitOrphans(10));
+    BOOST_CHECK(orphanage.Size() <= 10);
+    WITH_LOCK(g_cs_orphans, orphanage.LimitOrphans(0));
+    BOOST_CHECK(orphanage.Size() == 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
